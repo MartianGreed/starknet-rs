@@ -675,7 +675,7 @@ pub struct ContractClass {
     pub abi: Option<Vec<ContractAbiEntry>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct EntryPointsByType {
     #[serde(rename = "CONSTRUCTOR")]
@@ -691,7 +691,6 @@ pub struct EntryPointsByType {
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct ContractEntryPoint {
     /// The offset of the entry point in the program
-    #[serde_as(as = "NumAsHex")]
     pub offset: u64,
     /// A unique identifier of the entry point (function) in the program
     #[serde_as(as = "UfeHex")]

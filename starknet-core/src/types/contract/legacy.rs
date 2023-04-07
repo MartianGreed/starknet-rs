@@ -73,8 +73,7 @@ pub struct LegacyProgram {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct LegacyEntryPoint {
-    #[serde(with = "u64_hex")]
-    pub offset: u64,
+    pub offset: LegacyEntrypointOffset,
     #[serde_as(as = "UfeHex")]
     pub selector: FieldElement,
 }
@@ -137,6 +136,15 @@ pub struct LegacyIdentifier {
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct LegacyReferenceManager {
     pub references: Vec<LegacyReference>,
+}
+
+/// This field changed from hex string to number on 0.11.0.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+#[serde(untagged)]
+pub enum LegacyEntrypointOffset {
+    U64AsHex(#[serde(with = "u64_hex")] u64),
+    U64AsInt(u64),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,6 +308,24 @@ pub struct LegacyMember {
 
 struct ProgramForHintedHash;
 struct AttributeForHintedHash;
+
+impl From<LegacyEntrypointOffset> for u64 {
+    fn from(value: LegacyEntrypointOffset) -> Self {
+        match value {
+            LegacyEntrypointOffset::U64AsHex(inner) => inner,
+            LegacyEntrypointOffset::U64AsInt(inner) => inner,
+        }
+    }
+}
+
+impl From<LegacyEntrypointOffset> for FieldElement {
+    fn from(value: LegacyEntrypointOffset) -> Self {
+        match value {
+            LegacyEntrypointOffset::U64AsHex(inner) => inner.into(),
+            LegacyEntrypointOffset::U64AsInt(inner) => inner.into(),
+        }
+    }
+}
 
 // Manually implementing this so we can put `type` at the end:
 // https://github.com/xJonathanLEI/starknet-rs/issues/216
@@ -650,6 +676,8 @@ fn should_skip_attributes_for_hinted_hash(value: &Option<Vec<LegacyAttribute>>) 
 
 #[cfg(test)]
 mod tests {
+    use crate::types::contract::DeployedClass;
+
     use super::*;
 
     #[derive(serde::Deserialize)]
@@ -660,83 +688,121 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    fn test_artifact_deser_oz_account() {
-        serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.txt"
-        ))
-        .unwrap();
+    fn test_legacy_artifact_deser() {
+        for raw_artifact in [
+            include_str!("../../../test-data/contracts/cairo0/artifacts/oz_account.txt"),
+            include_str!("../../../test-data/contracts/cairo0/artifacts/event_example.txt"),
+            include_str!("../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/oz_account.txt"),
+            include_str!(
+                "../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/event_example.txt"
+            ),
+        ]
+        .into_iter()
+        {
+            serde_json::from_str::<LegacyContractClass>(raw_artifact).unwrap();
+        }
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    fn test_artifact_deser_event_example() {
-        serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/event_example.txt"
+    fn test_get_full_contract_deser_cairo_0() {
+        let class = serde_json::from_str::<DeployedClass>(include_str!(
+            "../../../test-data/raw_gateway_responses/get_full_contract/1_cairo_0.txt"
         ))
         .unwrap();
+        assert!(matches!(class, DeployedClass::LegacyClass(_)));
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    fn test_get_full_contract_deser_code() {
-        serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/raw_gateway_responses/get_full_contract/1_code.txt"
+    fn test_get_full_contract_deser_cairo_1() {
+        let class = serde_json::from_str::<DeployedClass>(include_str!(
+            "../../../test-data/raw_gateway_responses/get_full_contract/2_cairo_1.txt"
         ))
         .unwrap();
+        assert!(matches!(class, DeployedClass::SierraClass(_)));
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    fn test_get_full_contract_deser_all_abi_types() {
-        serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/raw_gateway_responses/get_full_contract/2_all_abi_types.txt"
+    fn test_get_class_by_hash_deser_cairo_0() {
+        let class = serde_json::from_str::<DeployedClass>(include_str!(
+            "../../../test-data/raw_gateway_responses/get_class_by_hash/1_cairo_0.txt"
         ))
         .unwrap();
+        assert!(matches!(class, DeployedClass::LegacyClass(_)));
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    fn test_get_class_by_hash_deser() {
-        serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/raw_gateway_responses/get_class_by_hash/1_success.txt"
+    fn test_get_class_by_hash_deser_cairo_1() {
+        let class = serde_json::from_str::<DeployedClass>(include_str!(
+            "../../../test-data/raw_gateway_responses/get_class_by_hash/3_cairo_1.txt"
         ))
         .unwrap();
+        assert!(matches!(class, DeployedClass::SierraClass(_)));
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_contract_class_hash() {
-        let artifact = serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.txt"
-        ))
-        .unwrap();
-        let computed_hash = artifact.class_hash().unwrap();
+        for (raw_artifact, raw_hashes) in [
+            (
+                include_str!("../../../test-data/contracts/cairo0/artifacts/oz_account.txt"),
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/oz_account.hashes.json"
+                ),
+            ),
+            (
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/oz_account.txt"
+                ),
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/oz_account.hashes.json"
+                ),
+            ),
+        ]
+        .into_iter()
+        {
+            let artifact = serde_json::from_str::<LegacyContractClass>(raw_artifact).unwrap();
+            let computed_hash = artifact.class_hash().unwrap();
 
-        let hashes: ContractHashes = serde_json::from_str(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.hashes.json"
-        ))
-        .unwrap();
-        let expected_hash = FieldElement::from_hex_be(&hashes.class_hash).unwrap();
+            let hashes: ContractHashes = serde_json::from_str(raw_hashes).unwrap();
+            let expected_hash = FieldElement::from_hex_be(&hashes.class_hash).unwrap();
 
-        assert_eq!(computed_hash, expected_hash);
+            assert_eq!(computed_hash, expected_hash);
+        }
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_contract_hinted_class_hash() {
-        let artifact = serde_json::from_str::<LegacyContractClass>(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.txt"
-        ))
-        .unwrap();
-        let computed_hash = artifact.hinted_class_hash().unwrap();
+        for (raw_artifact, raw_hashes) in [
+            (
+                include_str!("../../../test-data/contracts/cairo0/artifacts/oz_account.txt"),
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/oz_account.hashes.json"
+                ),
+            ),
+            (
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/oz_account.txt"
+                ),
+                include_str!(
+                    "../../../test-data/contracts/cairo0/artifacts/pre-0.11.0/oz_account.hashes.json"
+                ),
+            ),
+        ]
+        .into_iter()
+        {
+            let artifact = serde_json::from_str::<LegacyContractClass>(raw_artifact).unwrap();
+            let computed_hash = artifact.hinted_class_hash().unwrap();
 
-        let hashes: ContractHashes = serde_json::from_str(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.hashes.json"
-        ))
-        .unwrap();
-        let expected_hash = FieldElement::from_hex_be(&hashes.hinted_class_hash).unwrap();
+            let hashes: ContractHashes = serde_json::from_str(raw_hashes).unwrap();
+            let expected_hash = FieldElement::from_hex_be(&hashes.hinted_class_hash).unwrap();
 
-        assert_eq!(computed_hash, expected_hash);
+            assert_eq!(computed_hash, expected_hash);
+        }
     }
 
     #[test]
@@ -744,7 +810,7 @@ mod tests {
     fn test_artifact_json_equivalence() {
         // Removes '\n' or "\r\n" at the end
         let original_text =
-            include_str!("../../../test-data/contracts/artifacts/legacy/oz_account.txt");
+            include_str!("../../../test-data/contracts/cairo0/artifacts/oz_account.txt");
         let original_text = original_text
             .trim_end_matches("\r\n")
             .trim_end_matches('\n');

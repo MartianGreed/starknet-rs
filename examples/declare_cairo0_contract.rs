@@ -24,7 +24,7 @@ async fn main() {
     let account = SingleOwnerAccount::new(provider, signer, address, chain_id::TESTNET);
 
     let result = account
-        .declare(Arc::new(contract_artifact))
+        .declare_legacy(Arc::new(contract_artifact))
         .send()
         .await
         .unwrap();

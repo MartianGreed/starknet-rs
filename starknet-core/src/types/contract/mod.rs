@@ -1,17 +1,31 @@
-use std::collections::BTreeMap;
+use std::io::Write;
 
+use flate2::{write::GzEncoder, Compression};
 use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use starknet_crypto::{poseidon_hash_many, PoseidonHasher};
 
 use crate::{
-    serde::{json::to_string_pythonic, unsigned_field_element::UfeHex},
+    serde::{
+        byte_array::base64::serialize as base64_ser, json::to_string_pythonic,
+        unsigned_field_element::UfeHex,
+    },
     types::FieldElement,
-    utils::{cairo_short_string_to_felt, starknet_keccak, CairoShortStringToFeltError},
+    utils::{
+        cairo_short_string_to_felt, normalize_address, starknet_keccak, CairoShortStringToFeltError,
+    },
 };
 
 /// Module containing types related to artifacts of contracts compiled with a Cairo 0.x compiler.
 pub mod legacy;
+
+/// Cairo string for "CONTRACT_CLASS_V0.1.0"
+const PREFIX_CONTRACT_CLASS_V0_1_0: FieldElement = FieldElement::from_mont([
+    5800711240972404213,
+    15539482671244488427,
+    18446734822722598327,
+    37302452645455172,
+]);
 
 /// Cairo string for "COMPILED_CLASS_V1"
 const PREFIX_COMPILED_CLASS_V1: FieldElement = FieldElement::from_mont([
@@ -23,9 +37,18 @@ const PREFIX_COMPILED_CLASS_V1: FieldElement = FieldElement::from_mont([
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum ContractArtifact {
     SierraClass(SierraClass),
     CompiledClass(CompiledClass),
+    LegacyClass(legacy::LegacyContractClass),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum DeployedClass {
+    SierraClass(FlattenedSierraClass),
     LegacyClass(legacy::LegacyContractClass),
 }
 
@@ -42,7 +65,7 @@ pub struct SierraClass {
 }
 
 #[serde_as]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct CompiledClass {
     pub prime: String,
@@ -50,7 +73,30 @@ pub struct CompiledClass {
     #[serde_as(as = "Vec<UfeHex>")]
     pub bytecode: Vec<FieldElement>,
     pub hints: Vec<Hint>,
+    pub pythonic_hints: Option<Vec<PythonicHint>>,
     pub entry_points_by_type: EntrypointList<CompiledClassEntrypoint>,
+}
+
+#[serde_as]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+pub struct FlattenedSierraClass {
+    #[serde_as(as = "Vec<UfeHex>")]
+    pub sierra_program: Vec<FieldElement>,
+    pub contract_class_version: String,
+    pub entry_points_by_type: EntrypointList<SierraClassEntrypoint>,
+    pub abi: String,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+pub struct CompressedSierraClass {
+    #[serde(serialize_with = "base64_ser")]
+    pub sierra_program: Vec<u8>,
+    pub contract_class_version: String,
+    pub entry_points_by_type: EntrypointList<SierraClassEntrypoint>,
+    pub abi: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,10 +131,20 @@ pub struct SierraClassEntrypoint {
 pub enum AbiEntry {
     Function(AbiFunction),
     Event(AbiEvent),
+    Struct(AbiStruct),
+    Enum(AbiEnum),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Hint {
+    pub id: u64,
+    // For convenience we just treat it as an opaque JSON value here, unless a use case justifies
+    // implementing the structure. (We no longer need the hints for the class hash anyways.)
+    pub code: Vec<serde_json::Value>,
 }
 
 #[derive(Debug)]
-pub struct Hint {
+pub struct PythonicHint {
     pub id: u64,
     pub code: Vec<String>,
 }
@@ -107,8 +163,8 @@ pub struct CompiledClassEntrypoint {
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct AbiFunction {
     pub name: String,
-    pub inputs: Vec<AbiInput>,
-    pub output_ty: String,
+    pub inputs: Vec<AbiNamedMember>,
+    pub outputs: Vec<AbiOutput>,
     pub state_mutability: StateMutability,
 }
 
@@ -116,14 +172,34 @@ pub struct AbiFunction {
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
 pub struct AbiEvent {
     pub name: String,
-    pub inputs: Vec<AbiInput>,
+    pub inputs: Vec<AbiNamedMember>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
-pub struct AbiInput {
+pub struct AbiStruct {
     pub name: String,
-    pub ty: String,
+    pub members: Vec<AbiNamedMember>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+pub struct AbiEnum {
+    pub name: String,
+    pub variants: Vec<AbiNamedMember>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+pub struct AbiNamedMember {
+    pub name: String,
+    pub r#type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
+pub struct AbiOutput {
+    pub r#type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +225,95 @@ pub enum CompressProgramError {
     Io(std::io::Error),
 }
 
+impl SierraClass {
+    pub fn class_hash(&self) -> Result<FieldElement, ComputeClassHashError> {
+        // Technically we don't have to use the Pythonic JSON style here. Doing this just to align
+        // with the official `cairo-lang` CLI.
+        //
+        // TODO: add an `AbiFormatter` trait and let users choose which one to use.
+        let abi_str = to_string_pythonic(&self.abi).map_err(ComputeClassHashError::Json)?;
+
+        let mut hasher = PoseidonHasher::new();
+        hasher.update(PREFIX_CONTRACT_CLASS_V0_1_0);
+
+        // Hashes entry points
+        hasher.update(hash_sierra_entrypoints(&self.entry_points_by_type.external));
+        hasher.update(hash_sierra_entrypoints(
+            &self.entry_points_by_type.l1_handler,
+        ));
+        hasher.update(hash_sierra_entrypoints(
+            &self.entry_points_by_type.constructor,
+        ));
+
+        // Hashes ABI
+        hasher.update(starknet_keccak(abi_str.as_bytes()));
+
+        // Hashes Sierra program
+        hasher.update(poseidon_hash_many(&self.sierra_program));
+
+        Ok(normalize_address(hasher.finalize()))
+    }
+
+    pub fn flatten(self) -> Result<FlattenedSierraClass, serde_json::Error> {
+        let abi = to_string_pythonic(&self.abi)?;
+
+        Ok(FlattenedSierraClass {
+            sierra_program: self.sierra_program,
+            contract_class_version: self.contract_class_version,
+            entry_points_by_type: self.entry_points_by_type,
+            abi,
+        })
+    }
+}
+
+impl FlattenedSierraClass {
+    pub fn class_hash(&self) -> FieldElement {
+        let mut hasher = PoseidonHasher::new();
+        hasher.update(PREFIX_CONTRACT_CLASS_V0_1_0);
+
+        // Hashes entry points
+        hasher.update(hash_sierra_entrypoints(&self.entry_points_by_type.external));
+        hasher.update(hash_sierra_entrypoints(
+            &self.entry_points_by_type.l1_handler,
+        ));
+        hasher.update(hash_sierra_entrypoints(
+            &self.entry_points_by_type.constructor,
+        ));
+
+        // Hashes ABI
+        hasher.update(starknet_keccak(self.abi.as_bytes()));
+
+        // Hashes Sierra program
+        hasher.update(poseidon_hash_many(&self.sierra_program));
+
+        normalize_address(hasher.finalize())
+    }
+
+    pub fn compress(&self) -> Result<CompressedSierraClass, CompressProgramError> {
+        #[serde_as]
+        #[derive(Serialize)]
+        struct SierraProgram<'a>(#[serde_as(as = "Vec<UfeHex>")] &'a Vec<FieldElement>);
+
+        let program_json = serde_json::to_string(&SierraProgram(&self.sierra_program))
+            .map_err(CompressProgramError::Json)?;
+
+        // Use best compression level to optimize for payload size
+        let mut gzip_encoder = GzEncoder::new(Vec::new(), Compression::best());
+        gzip_encoder
+            .write_all(program_json.as_bytes())
+            .map_err(CompressProgramError::Io)?;
+
+        let compressed_program = gzip_encoder.finish().map_err(CompressProgramError::Io)?;
+
+        Ok(CompressedSierraClass {
+            sierra_program: compressed_program,
+            contract_class_version: self.contract_class_version.clone(),
+            entry_points_by_type: self.entry_points_by_type.clone(),
+            abi: self.abi.clone(),
+        })
+    }
+}
+
 impl CompiledClass {
     pub fn class_hash(&self) -> Result<FieldElement, ComputeClassHashError> {
         let mut hasher = PoseidonHasher::new();
@@ -168,91 +333,10 @@ impl CompiledClass {
                 .map_err(|_| ComputeClassHashError::InvalidBuiltinName)?,
         );
 
-        // Hashes hinted_compiled_class_hash
-        hasher.update(self.hinted_class_hash()?);
-
         // Hashes bytecode
         hasher.update(poseidon_hash_many(&self.bytecode));
 
         Ok(hasher.finalize())
-    }
-
-    pub fn hinted_class_hash(&self) -> Result<FieldElement, ComputeClassHashError> {
-        #[derive(Serialize)]
-        struct ClassForHintedHash<'a> {
-            program: ProgramForHintedHash<'a>,
-        }
-
-        #[serde_as]
-        #[derive(Serialize)]
-        struct ProgramForHintedHash<'a> {
-            // Hard-coded to be empty
-            builtins: [(); 0],
-            #[serde(skip_serializing_if = "Option::is_none")]
-            compiler_version: Option<&'a String>,
-            #[serde_as(as = "Vec<UfeHex>")]
-            data: &'a Vec<FieldElement>,
-            hints: BTreeMap<u64, Vec<HintForHintedHash<'a>>>,
-            prime: &'a String,
-        }
-
-        #[derive(Serialize)]
-        struct HintForHintedHash<'a> {
-            // Hard-coded to be empty
-            accessible_scopes: [(); 0],
-            code: &'a String,
-            flow_tracking_data: &'a EmptyFlowTrackingData<'a>,
-        }
-
-        #[derive(Serialize)]
-        struct EmptyFlowTrackingData<'a> {
-            ap_tracking: &'a EmptyApTrackingData,
-            reference_ids: EmptyReferenceIds,
-        }
-
-        #[derive(Default, Serialize)]
-        struct EmptyApTrackingData {
-            group: u64,
-            offset: u64,
-        }
-
-        #[derive(Default, Serialize)]
-        struct EmptyReferenceIds {}
-
-        let empty_ap_tracking_data = EmptyApTrackingData::default();
-        let empty_flow_tracking_data = EmptyFlowTrackingData {
-            ap_tracking: &empty_ap_tracking_data,
-            reference_ids: EmptyReferenceIds {},
-        };
-
-        // We shouldn't need to this if artifacts are guaranteed to have sorted hints?
-        // TODO: check compiler to see if it's guanranteed
-        let mut hints = BTreeMap::<u64, Vec<HintForHintedHash>>::new();
-        for hint in self.hints.iter() {
-            let transformed_hints = hint
-                .code
-                .iter()
-                .map(|code| HintForHintedHash {
-                    accessible_scopes: [],
-                    code,
-                    flow_tracking_data: &empty_flow_tracking_data,
-                })
-                .collect::<Vec<_>>();
-            hints.insert(hint.id, transformed_hints);
-        }
-
-        let serialized = to_string_pythonic(&ClassForHintedHash {
-            program: ProgramForHintedHash {
-                builtins: [],
-                compiler_version: Some(&self.compiler_version),
-                data: &self.bytecode,
-                hints,
-                prime: &self.prime,
-            },
-        })
-        .map_err(ComputeClassHashError::Json)?;
-
-        Ok(starknet_keccak(serialized.as_bytes()))
     }
 
     fn hash_entrypoints(
@@ -299,54 +383,27 @@ impl<'de> Deserialize<'de> for ContractArtifact {
     }
 }
 
-// Temporary workarond until this gets fixed, after which we drop the custom impl.
-//   https://github.com/starkware-libs/cairo/issues/2350
-//
-// Since there's currently no officially supported way of generating valid artifacts, our only
-// alternative is to ask users to manually patch the JSON files before loading them, which is far
-// worse than what we do here.
-impl<'de> Deserialize<'de> for CompiledClass {
+// We need to manually implement this because `arbitrary_precision` doesn't work with `untagged`:
+//   https://github.com/serde-rs/serde/issues/1183
+impl<'de> Deserialize<'de> for DeployedClass {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[serde_as]
-        #[derive(Deserialize)]
-        #[cfg_attr(feature = "no_unknown_fields", serde(deny_unknown_fields))]
-        struct Intermediate {
-            prime: String,
-            compiler_version: String,
-            #[serde_as(as = "Vec<UfeHex>")]
-            bytecode: Vec<FieldElement>,
-            hints: Vec<Hint>,
-            entry_points_by_type: EntrypointList<CompiledClassEntrypoint>,
+        let temp_value = serde_json::Value::deserialize(deserializer)?;
+        if let Ok(value) = FlattenedSierraClass::deserialize(&temp_value) {
+            return Ok(Self::SierraClass(value));
         }
-
-        let mut intermediate = Intermediate::deserialize(deserializer)?;
-        intermediate
-            .entry_points_by_type
-            .external
-            .sort_by_key(|entry| entry.selector);
-        intermediate
-            .entry_points_by_type
-            .l1_handler
-            .sort_by_key(|entry| entry.selector);
-        intermediate
-            .entry_points_by_type
-            .constructor
-            .sort_by_key(|entry| entry.selector);
-
-        Ok(Self {
-            prime: intermediate.prime,
-            compiler_version: intermediate.compiler_version,
-            bytecode: intermediate.bytecode,
-            hints: intermediate.hints,
-            entry_points_by_type: intermediate.entry_points_by_type,
-        })
+        if let Ok(value) = legacy::LegacyContractClass::deserialize(&temp_value) {
+            return Ok(Self::LegacyClass(value));
+        }
+        Err(serde::de::Error::custom(
+            "data did not match any variant of enum DeployedClass",
+        ))
     }
 }
 
-impl Serialize for Hint {
+impl Serialize for PythonicHint {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -358,7 +415,7 @@ impl Serialize for Hint {
     }
 }
 
-impl<'de> Deserialize<'de> for Hint {
+impl<'de> Deserialize<'de> for PythonicHint {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -389,31 +446,58 @@ impl<'de> Deserialize<'de> for Hint {
     }
 }
 
+fn hash_sierra_entrypoints(entrypoints: &[SierraClassEntrypoint]) -> FieldElement {
+    let mut hasher = PoseidonHasher::new();
+
+    for entry in entrypoints.iter() {
+        hasher.update(entry.selector);
+        hasher.update(entry.function_idx.into());
+    }
+
+    hasher.finalize()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    struct ContractHashes {
+        sierra_class_hash: String,
+        compiled_class_hash: String,
+    }
+
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_sierra_class_deser() {
-        // Artifact generated from cairo v1.0.0-alpha.3
-        match serde_json::from_str::<ContractArtifact>(include_str!(
-            "../../../test-data/contracts/artifacts/erc20_sierra.txt"
-        )) {
-            Ok(ContractArtifact::SierraClass(_)) => {}
-            _ => panic!("Unexpected result"),
+        // Artifacts generated from cairo v1.0.0-alpha.6
+        for raw_artifact in [
+            include_str!("../../../test-data/contracts/cairo1/artifacts/abi_types_sierra.txt"),
+            include_str!("../../../test-data/contracts/cairo1/artifacts/erc20_sierra.txt"),
+        ]
+        .into_iter()
+        {
+            match serde_json::from_str::<ContractArtifact>(raw_artifact) {
+                Ok(ContractArtifact::SierraClass(_)) => {}
+                _ => panic!("Unexpected result"),
+            }
         }
     }
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_compiled_class_deser() {
-        // Artifact generated from cairo v1.0.0-alpha.3
-        match serde_json::from_str::<ContractArtifact>(include_str!(
-            "../../../test-data/contracts/artifacts/erc20_compiled.txt"
-        )) {
-            Ok(ContractArtifact::CompiledClass(_)) => {}
-            _ => panic!("Unexpected result"),
+        // Artifacts generated from cairo v1.0.0-alpha.6
+        for raw_artifact in [
+            include_str!("../../../test-data/contracts/cairo1/artifacts/abi_types_compiled.txt"),
+            include_str!("../../../test-data/contracts/cairo1/artifacts/erc20_compiled.txt"),
+        ]
+        .into_iter()
+        {
+            match serde_json::from_str::<ContractArtifact>(raw_artifact) {
+                Ok(ContractArtifact::CompiledClass(_)) => {}
+                _ => panic!("Unexpected result"),
+            }
         }
     }
 
@@ -421,7 +505,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_legacy_class_deser() {
         match serde_json::from_str::<ContractArtifact>(include_str!(
-            "../../../test-data/contracts/artifacts/legacy/oz_account.txt"
+            "../../../test-data/contracts/cairo0/artifacts/oz_account.txt"
         )) {
             Ok(ContractArtifact::LegacyClass(_)) => {}
             _ => panic!("Unexpected result"),
@@ -430,20 +514,53 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn test_sierra_class_hash() {
+        for (raw_artifact, raw_hashes) in [
+            (
+                include_str!("../../../test-data/contracts/cairo1/artifacts/erc20_sierra.txt"),
+                include_str!("../../../test-data/contracts/cairo1/artifacts/erc20.hashes.json"),
+            ),
+            (
+                include_str!("../../../test-data/contracts/cairo1/artifacts/abi_types_sierra.txt"),
+                include_str!("../../../test-data/contracts/cairo1/artifacts/abi_types.hashes.json"),
+            ),
+        ]
+        .into_iter()
+        {
+            let sierra_class = serde_json::from_str::<SierraClass>(raw_artifact).unwrap();
+            let computed_hash = sierra_class.class_hash().unwrap();
+
+            let hashes: ContractHashes = serde_json::from_str(raw_hashes).unwrap();
+            let expected_hash = FieldElement::from_hex_be(&hashes.sierra_class_hash).unwrap();
+
+            assert_eq!(computed_hash, expected_hash);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     fn test_compiled_class_hash() {
-        // Hash obtained from sequencer in integration environment
-        // TODO: automate class hash generation like for legacy contracts
-        let expected_hash = FieldElement::from_hex_be(
-            "0xb638af50c673869f62fd0079232a79a3f508532c7ec24af78cdf36b9dbbe6b",
-        )
-        .unwrap();
+        for (raw_artifact, raw_hashes) in [
+            (
+                include_str!("../../../test-data/contracts/cairo1/artifacts/erc20_compiled.txt"),
+                include_str!("../../../test-data/contracts/cairo1/artifacts/erc20.hashes.json"),
+            ),
+            (
+                include_str!(
+                    "../../../test-data/contracts/cairo1/artifacts/abi_types_compiled.txt"
+                ),
+                include_str!("../../../test-data/contracts/cairo1/artifacts/abi_types.hashes.json"),
+            ),
+        ]
+        .into_iter()
+        {
+            let compiled_class = serde_json::from_str::<CompiledClass>(raw_artifact).unwrap();
+            let computed_hash = compiled_class.class_hash().unwrap();
 
-        let compiled_class = serde_json::from_str::<CompiledClass>(include_str!(
-            "../../../test-data/contracts/artifacts/erc20_compiled.txt"
-        ))
-        .unwrap();
-        let computed_hash = compiled_class.class_hash().unwrap();
+            let hashes: ContractHashes = serde_json::from_str(raw_hashes).unwrap();
+            let expected_hash = FieldElement::from_hex_be(&hashes.compiled_class_hash).unwrap();
 
-        assert_eq!(expected_hash, computed_hash);
+            assert_eq!(computed_hash, expected_hash);
+        }
     }
 }

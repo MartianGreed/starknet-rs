@@ -5,7 +5,7 @@ use crate::{
 
 use async_trait::async_trait;
 use starknet_core::types::{
-    contract::legacy::{LegacyContractClass, LegacyContractCode},
+    contract::{legacy::LegacyContractCode, CompiledClass, DeployedClass},
     AccountTransaction, AddTransactionResult, Block, BlockId, BlockTraces, CallContractResult,
     CallFunction, CallL1Handler, ContractAddresses, FeeEstimate, FieldElement, StateUpdate,
     TransactionInfo, TransactionReceipt, TransactionRequest, TransactionSimulationInfo,
@@ -16,6 +16,8 @@ use starknet_core::types::{
 pub enum JsonRpcProviderError<T> {
     #[error("Method not supported")]
     NotSupported,
+    #[error("Failed to convert between JSON-RPC and sequencer gateway models")]
+    ConversionError,
     #[error(transparent)]
     JsonError(serde_json::Error),
     #[error(transparent)]
@@ -38,7 +40,10 @@ where
     ) -> Result<AddTransactionResult, ProviderError<Self::Error>> {
         match tx {
             TransactionRequest::Declare(tx) => self
-                .add_declare_transaction(&tx.into())
+                .add_declare_transaction(
+                    &tx.try_into()
+                        .map_err(|_| ProviderError::Other(Self::Error::ConversionError))?,
+                )
                 .await
                 .map(|result| result.into())
                 .map_err(|err| err.into()),
@@ -73,8 +78,15 @@ where
         &self,
         tx: AccountTransaction,
         block_identifier: BlockId,
+        skip_validate: bool,
     ) -> Result<FeeEstimate, ProviderError<Self::Error>> {
-        let tx: BroadcastedTransaction = tx.into();
+        if skip_validate {
+            return Err(ProviderError::Other(Self::Error::NotSupported));
+        }
+
+        let tx: BroadcastedTransaction = tx
+            .try_into()
+            .map_err(|_| ProviderError::Other(Self::Error::NotSupported))?;
         self.estimate_fee(tx, &block_identifier.into())
             .await
             .map(|est| est.into())
@@ -85,6 +97,7 @@ where
         &self,
         _txs: &[AccountTransaction],
         _block_identifier: BlockId,
+        _skip_validate: bool,
     ) -> Result<Vec<FeeEstimate>, ProviderError<Self::Error>> {
         Err(ProviderError::Other(Self::Error::NotSupported))
     }
@@ -101,6 +114,7 @@ where
         &self,
         _tx: AccountTransaction,
         _block_identifier: BlockId,
+        _skip_validate: bool,
     ) -> Result<TransactionSimulationInfo, ProviderError<Self::Error>> {
         Err(ProviderError::Other(Self::Error::NotSupported))
     }
@@ -138,7 +152,15 @@ where
         &self,
         _contract_address: FieldElement,
         _block_identifier: BlockId,
-    ) -> Result<LegacyContractClass, ProviderError<Self::Error>> {
+    ) -> Result<DeployedClass, ProviderError<Self::Error>> {
+        Err(ProviderError::Other(Self::Error::NotSupported))
+    }
+
+    async fn get_compiled_class_by_class_hash(
+        &self,
+        _class_hash: FieldElement,
+        _block_identifier: BlockId,
+    ) -> Result<CompiledClass, ProviderError<Self::Error>> {
         Err(ProviderError::Other(Self::Error::NotSupported))
     }
 
@@ -153,7 +175,8 @@ where
     async fn get_class_by_hash(
         &self,
         _class_hash: FieldElement,
-    ) -> Result<LegacyContractClass, ProviderError<Self::Error>> {
+        _block_identifier: BlockId,
+    ) -> Result<DeployedClass, ProviderError<Self::Error>> {
         Err(ProviderError::Other(Self::Error::NotSupported))
     }
 
